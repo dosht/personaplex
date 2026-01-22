@@ -8,8 +8,6 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
-    clang \
-    ca-certificates \
     libopus-dev \
  && rm -rf /var/lib/apt/lists/*
 
