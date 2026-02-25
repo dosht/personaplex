@@ -52,6 +52,15 @@ from .utils.logging import setup_logger, ColorizedLog
 
 
 logger = setup_logger(__name__)
+
+# Phrases that trigger routing to DeepSeek
+# These are natural filler phrases that Moshi reliably produces
+DEFER_PHRASES = [
+    "let me check",
+    "let me find",
+    "let me look",
+    "let me see",
+]
 DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
@@ -115,7 +124,107 @@ class ServerState:
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
-    
+
+    # Transgate product context for DeepSeek
+    TRANSGATE_CONTEXT = """
+# Transgate - AI Audio Transcription Platform
+
+## Pricing Plans
+
+### Pay As You Go - $1.49/hour
+- Pay only for what you use
+- Hours valid for 1 year
+- Best for occasional users
+
+### Premium - $14/month
+- 20 hours of transcription per month
+- Yearly option: $10/month
+
+### Business - $21/month
+- 40 hours of transcription per month
+- Yearly option: $15/month
+
+## Key Features
+- 50+ languages supported
+- 95-98% accuracy in clean audio
+- AI Summarization and Smart Highlights
+- Interactive AI Chat with transcripts
+- No limit on file length
+- Supports: mp3, wav, mp4, mov, avi, and all audio/video types
+- REST API for developers
+- HIPAA/GDPR compliant
+
+## Free Trial
+- 20 minutes free transcription
+- No credit card required
+"""
+
+    async def call_deepseek(self, query: str, conversation_context: str = "") -> str:
+        """
+        Call DeepSeek API for complex product questions.
+        Used when PersonaPlex defers with phrases like "let me check".
+
+        Args:
+            query: The recent conversation context indicating what user asked about
+            conversation_context: Recent conversation history for additional context
+        """
+        api_key = os.environ.get('DEEPSEEK_API_KEY', '')
+        if not api_key:
+            return "I apologize, but I'm unable to look that up right now. Please try again later."
+
+        system_prompt = f"""You are a helpful voice assistant for Transgate, an AI-powered transcription platform.
+
+{self.TRANSGATE_CONTEXT}
+
+INSTRUCTIONS:
+- Provide accurate, concise information about Transgate
+- Keep responses brief (2-3 sentences max) as they will be spoken aloud
+- Be friendly and conversational
+- If asked about pricing, mention the free trial first
+- Don't use bullet points or lists - speak naturally"""
+
+        # Build the user message with context
+        user_message = query
+        if conversation_context:
+            user_message = f"Recent conversation:\n{conversation_context}\n\nRespond to: {query}"
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            "max_tokens": 150,  # Shorter for voice
+            "temperature": 0.7
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.deepseek.com/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data["choices"][0]["message"]["content"]
+                    else:
+                        error_text = await resp.text()
+                        logger.error(f"DeepSeek API error: {resp.status} - {error_text}")
+                        return "I'm having trouble looking that up. Let me help you with something else."
+        except asyncio.TimeoutError:
+            logger.error("DeepSeek API timeout")
+            return "That's taking longer than expected. Let me help you with something else."
+        except Exception as e:
+            logger.error(f"DeepSeek API exception: {e}")
+            return "I encountered an issue looking that up. Please try again."
+
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
@@ -145,30 +254,33 @@ class ServerState:
         # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
         # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
         
-        # Construct full voice prompt path
+        # Construct full voice prompt path (query params now optional)
         requested_voice_prompt_path = None
         voice_prompt_path = None
-        if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query["voice_prompt"]
-            requested_voice_prompt_path = None
-            if voice_prompt_filename is not None:
-                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
-            # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
-            if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
-                raise FileNotFoundError(
-                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
-                )
+        voice_prompt_filename = request.query.get("voice_prompt", "")  # Optional
+        if self.voice_prompt_dir is not None and voice_prompt_filename:
+            requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+            # If the voice prompt file does not exist, log warning but continue
+            if not os.path.exists(requested_voice_prompt_path):
+                clog.log("warning", f"Voice prompt '{voice_prompt_filename}' not found, using default")
+                requested_voice_prompt_path = None
             else:
                 voice_prompt_path = requested_voice_prompt_path
-                
-        if self.lm_gen.voice_prompt != voice_prompt_path:
+
+        if voice_prompt_path and self.lm_gen.voice_prompt != voice_prompt_path:
             if voice_prompt_path.endswith('.pt'):
                 # Load pre-saved voice prompt embeddings
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+
+        # Text prompt is optional - use empty list (not None) to avoid iteration errors
+        text_prompt = request.query.get("text_prompt", "")
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if text_prompt else []
         seed = int(request["seed"]) if "seed" in request.query else None
+
+        # TTS injection queue with backpressure (max 10 pending injections)
+        tts_inject_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
 
         async def recv_loop():
             nonlocal close
@@ -194,22 +306,149 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:  # audio
                         payload = message[1:]
-                        opus_reader.append_bytes(payload)
+                        try:
+                            opus_reader.append_bytes(payload)
+                        except ValueError as e:
+                            # Stream may be closed, break out gracefully
+                            clog.log("warning", f"opus_reader closed: {e}")
+                            break
+                    elif kind == 7:  # TTS inject
+                        try:
+                            text = message[1:].decode('utf-8')
+                            if text.strip():  # Ignore empty strings
+                                try:
+                                    tts_inject_queue.put_nowait(text)
+                                    clog.log("info", f"TTS inject queued: {text[:50]}...")
+                                except asyncio.QueueFull:
+                                    clog.log("error", "TTS inject queue full, rejecting request")
+                                    error_msg = b"\x05" + bytes("TTS queue full", encoding="utf8")
+                                    await ws.send_bytes(error_msg)
+                            else:
+                                clog.log("warning", "TTS inject received empty text")
+                        except UnicodeDecodeError as e:
+                            clog.log("error", f"TTS inject failed to decode UTF-8: {e}")
+                            error_msg = b"\x05" + bytes(f"Invalid UTF-8: {e}", encoding="utf8")
+                            await ws.send_bytes(error_msg)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
                 close = True
                 clog.log("info", "connection closed")
 
+        async def process_tts_inject(text: str):
+            """
+            Convert text to speech using the LM's current voice state.
+
+            This method:
+            1. Tokenizes the input text
+            2. Forces each text token through the LM to generate audio tokens
+            3. Decodes audio tokens to PCM using Mimi
+            4. Sends audio to client via opus_writer
+            5. Sends transcript text back to client
+            """
+            try:
+                clog.log("info", f"Processing TTS inject: {text[:50]}...")
+
+                # Tokenize the input text
+                tokens = self.text_tokenizer.encode(text)
+
+                # Generate audio for each text token
+                for text_token in tokens:
+                    if close:
+                        return
+
+                    # Create a silence frame as user input (no user speaking during injection)
+                    # Use zeros for silence - same approach as warmup
+                    silence_chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+                    silence_codes = self.mimi.encode(silence_chunk)
+                    _ = self.other_mimi.encode(silence_chunk)
+
+                    # Force the text token through the LM
+                    for c in range(silence_codes.shape[-1]):
+                        audio_tokens = self.lm_gen.step(
+                            input_tokens=silence_codes[:, :, c: c + 1],
+                            text_token=text_token
+                        )
+
+                        if audio_tokens is None:
+                            continue
+
+                        # Decode audio tokens to PCM (24kHz mono)
+                        assert audio_tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                        main_pcm = self.mimi.decode(audio_tokens[:, 1:9])
+                        _ = self.other_mimi.decode(audio_tokens[:, 1:9])
+                        main_pcm = main_pcm.cpu()
+
+                        # Append to opus writer (expects numpy array)
+                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
+
+                    # Send the text token back for transcript
+                    # Replace sentence piece marker with space
+                    _text = self.text_tokenizer.id_to_piece(text_token)
+                    _text = _text.replace("▁", " ")
+
+                    # Send as text message (0x02)
+                    msg = b"\x02" + bytes(_text, encoding="utf8")
+                    await ws.send_bytes(msg)
+
+                    # Small yield to allow other async tasks to run
+                    await asyncio.sleep(0.001)
+
+                clog.log("info", f"TTS inject completed: {text[:50]}...")
+
+            except Exception as e:
+                clog.log("error", f"TTS injection failed: {e}")
+                # Send error message to client
+                error_msg = b"\x05" + bytes(f"TTS injection error: {str(e)}", encoding="utf8")
+                await ws.send_bytes(error_msg)
+
         async def opus_loop():
             all_pcm_data = None
+
+            # Conversation tracking for DeepSeek context
+            conversation_history: list[str] = []  # Recent utterances
+            current_utterance = ""  # Current sentence being built
+            defer_in_progress = False
+
+            async def handle_defer(filler_text: str, context: str):
+                """Handle deferred query via DeepSeek API."""
+                nonlocal defer_in_progress
+                try:
+                    clog.log("info", f"Defer detected. Filler: {filler_text[:50]}...")
+                    clog.log("info", f"Context: {context[:100]}...")
+
+                    # Call DeepSeek with filler as query hint and conversation as context
+                    response = await self.call_deepseek(filler_text, context)
+                    clog.log("info", f"DeepSeek response: {response[:50]}...")
+
+                    # Inject response directly (internal TTS)
+                    await process_tts_inject(response)
+
+                    # Add response to conversation history
+                    conversation_history.append(f"Assistant: {response}")
+                    # Keep history manageable (last 5 exchanges)
+                    while len(conversation_history) > 10:
+                        conversation_history.pop(0)
+
+                except Exception as e:
+                    clog.log("error", f"Defer handling failed: {e}")
+                finally:
+                    defer_in_progress = False
 
             while True:
                 if close:
                     return
+
+                # Check for TTS injection requests (non-blocking)
+                try:
+                    inject_text = tts_inject_queue.get_nowait()
+                    await process_tts_inject(inject_text)
+                except asyncio.QueueEmpty:
+                    pass
+
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
-                if pcm.shape[-1] == 0:
+                if pcm is None or pcm.shape[-1] == 0:
                     continue
                 if all_pcm_data is None:
                     all_pcm_data = pcm
@@ -236,6 +475,54 @@ class ServerState:
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
+
+                            # Build current utterance
+                            current_utterance += _text
+
+                            # Check for defer phrases (natural filler phrases that trigger DeepSeek)
+                            current_lower = current_utterance.lower()
+                            detected_phrase = None
+                            for phrase in DEFER_PHRASES:
+                                if phrase in current_lower:
+                                    detected_phrase = phrase
+                                    break
+
+                            if detected_phrase and not defer_in_progress:
+                                defer_in_progress = True
+
+                                # Extract filler text (what PersonaPlex said including the phrase)
+                                filler_text = current_utterance.strip()
+                                clog.log("info", f"[ROUTING] '{detected_phrase}' DETECTED -> DeepSeek | Context: '{filler_text}'")
+
+                                # Build conversation context from history
+                                context = "\n".join(conversation_history[-6:])  # Last 3 exchanges
+
+                                # Add current filler to history
+                                if filler_text:
+                                    conversation_history.append(f"Assistant: {filler_text}")
+
+                                # Reset for next utterance
+                                current_utterance = ""
+
+                                # Trigger DeepSeek call asynchronously
+                                if filler_text:
+                                    asyncio.create_task(handle_defer(filler_text, context))
+
+                                # Continue sending text to client (the filler phrase is natural speech)
+                                # Don't skip - let the user hear "let me check that for you"
+
+                            # On sentence boundaries, save to history and reset
+                            if _text.rstrip().endswith(('.', '?', '!')):
+                                # Only log direct responses (not deferred ones)
+                                if current_utterance.strip() and not defer_in_progress:
+                                    clog.log("info", f"[ROUTING] DIRECT response: '{current_utterance.strip()}'")
+                                    conversation_history.append(f"Assistant: {current_utterance.strip()}")
+                                    # Keep history manageable
+                                    while len(conversation_history) > 10:
+                                        conversation_history.pop(0)
+                                current_utterance = ""
+
+                            # Send text to client
                             msg = b"\x02" + bytes(_text, encoding="utf8")
                             await ws.send_bytes(msg)
                         else:
@@ -251,9 +538,9 @@ class ServerState:
                     await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
-        if len(request.query["text_prompt"]) > 0:
-            clog.log("info", f"text prompt: {request.query['text_prompt']}")
-        if len(request.query["voice_prompt"]) > 0:
+        if text_prompt:
+            clog.log("info", f"text prompt: {text_prompt}")
+        if voice_prompt_filename:
             clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
         close = False
         async with self.lock:

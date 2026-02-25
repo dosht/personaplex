@@ -1,0 +1,33 @@
+project-id: personaplex
+project-name: personaplex
+workflow:
+  story-states:
+  - draft
+  - ready
+  - in-progress
+  - review
+  - sign-off
+  - done
+  transitions:
+    draft:
+    - ready
+    ready:
+    - in-progress
+    in-progress:
+    - review
+    - ready
+    review:
+    - in-progress
+    - sign-off
+    sign-off:
+    - done
+    - review
+    done: []
+paths:
+  epics: docs/product/epics
+  stories: docs/product/epics
+  knowledge: docs/knowledge
+  lessons: docs/knowledge/lessons
+  patterns: docs/knowledge/patterns
+related-projects: {}
+knowledge-tags: []

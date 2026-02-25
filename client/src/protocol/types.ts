@@ -3,7 +3,8 @@ export type MessageType =
   | "audio"
   | "text"
   | "control"
-  | "metadata";
+  | "metadata"
+  | "tts_inject";
 
 export const VERSIONS_MAP = {
   0: 0b00000000,
@@ -45,6 +46,10 @@ export type WSMessage =
   }
   | {
     type:"ping";
+  }
+  | {
+    type: "tts_inject";
+    data: string;
   }
 
 

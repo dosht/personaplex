@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "claude-team": {
+      "command": "claude-team-mcp-server",
+      "args": []
+    }
+  }
+}

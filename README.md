@@ -13,6 +13,15 @@ PersonaPlex is a real-time, full-duplex speech-to-speech conversational model th
   <em>PersonaPlex Architecture</em>
 </p>
 
+## What this fork adds
+
+This is a fork of [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex) with two experimental additions:
+
+- **[Smart Routing](./SMART_ROUTING.md)** -- Route domain-specific queries to an external LLM (DeepSeek) and inject responses back into the speech stream via a TTS mechanism that forces text tokens through the existing model. Includes a new WebSocket protocol extension (message type `0x07`), server-side defer detection, and async LLM consultation.
+- **[Web Client](./WEB_CLIENT.md)** -- A complete browser client (Vite + React + TypeScript) with Opus WASM codecs, AudioWorklet-based adaptive jitter buffering, and an [embeddable widget version](https://github.com/dosht/voice-agent-demo) for product landing pages.
+
+We built this for a voice AI assistant widget on the [Transgate](https://transgate.ai) landing page. PersonaPlex handles low-latency full-duplex conversation out of the box, but the 7B backbone hallucinates on product-specific questions. Smart Routing is our attempt to fix that. The docs cover what worked, what didn't, and the fundamental timing challenges of augmenting full-duplex speech models at inference time.
+
 ## Usage
 
 ### Prerequisites
